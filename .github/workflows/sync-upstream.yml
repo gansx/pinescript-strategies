@@ -1,0 +1,121 @@
+name: Sync upstream (Alorse/pinescript-strategies)
+
+# 每月 1 日和 15 日 03:15 UTC
+on:
+  schedule:
+    - cron: '15 3 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/Alorse/pinescript-strategies.git 2>/dev/null || true
+          git fetch upstream master --force
+          git fetch upstream --tags --force || true
+
+      - name: Detect drift
+        id: drift
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+          echo "local  = $LOCAL"
+          echo "remote = $REMOTE"
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新"
+          else
+            BEHIND=$(git rev-list --count HEAD..upstream/master)
+            AHEAD=$(git rev-list --count upstream/master..HEAD)
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead_count=$AHEAD" >> "$GITHUB_OUTPUT"
+            echo "上游有 $BEHIND 个新提交，本地领先 $AHEAD 个"
+          fi
+
+      - name: Merge
+        id: merge
+        if: steps.drift.outputs.behind == 'true'
+        run: |
+          if git merge --no-edit upstream/master; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "merge 成功"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            echo "merge 冲突，已回滚"
+          fi
+
+      - name: Push
+        if: steps.drift.outputs.behind == 'true' && steps.merge.outputs.result == 'ok'
+        run: |
+          git push origin master
+          git push origin --tags --force-with-lease || git push origin --tags || true
+
+      - name: Stats
+        if: steps.merge.outputs.result == 'ok'
+        run: |
+          N=$(find . -name '*.pine' 2>/dev/null | wc -l)
+          L=$(find . -name '*.pine' -exec cat {} + 2>/dev/null | wc -l)
+          echo "### Pine 脚本: $N 个 / $L 行" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `上游同步冲突 ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## 自动同步遇到冲突，已回滚',
+              '',
+              `上游 \`Alorse/pinescript-strategies\` 有 **${process.env.BEHIND}** 个新提交，merge 失败。`,
+              '',
+              '### 处理',
+              '```bash',
+              'git fetch upstream && git merge upstream/master',
+              'git push origin master',
+              '```',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `再次冲突 @ ${new Date().toISOString()}`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body, labels: ['upstream-sync']
+            });
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind_count }}
