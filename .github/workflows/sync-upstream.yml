@@ -36,7 +36,7 @@ jobs:
       - name: Add upstream
         run: |
           git remote add upstream https://github.com/Alorse/pinescript-strategies.git 2>/dev/null || true
-          git fetch upstream master --force
+          git fetch upstream master:refs/remotes/upstream/master --force
           git fetch upstream --tags --force || true
 
       - name: Detect drift
